@@ -1,0 +1,59 @@
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+driver = webdriver.Chrome()
+driver.get('https://www.ncbi.nlm.nih.gov/snp')
+
+# search
+driver.find_element(By.ID, "term").send_keys("PINK1")
+driver.find_element(By.ID, "search").click()
+
+# missense filter
+driver.find_element(By.XPATH, '//*[@id="_Function_Class"]/li/ul/li[6]/a').click()
+
+all_rs = list()
+
+while True:
+    # wait for results to load
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "div.rprt"))
+    )
+
+    # extract rs IDs on current page
+    rs_links = driver.find_elements(
+        By.XPATH,
+        "//div[contains(@class,'rprt')]//div[contains(@class,'supp')]//a[starts-with(text(),'rs')]"
+    )
+
+    for link in rs_links:
+        all_rs.append(link.text)
+
+    print(f"Collected so far: {len(all_rs)}")
+
+    # check if next is clickable
+    next_buttons = driver.find_elements(By.CSS_SELECTOR, "a.page_link.next")
+
+    if not next_buttons:
+        print("Last page reached")
+        break
+
+    first_result = driver.find_element(By.CSS_SELECTOR, "div.rprt")
+
+    driver.execute_script("arguments[0].click();", next_buttons[0])
+
+    WebDriverWait(driver, 10).until(
+        EC.staleness_of(first_result)
+    )
+
+distinct_all_rs = list(set(all_rs))
+
+driver.quit()
+
+# Save to CSV
+df = pd.DataFrame({"rs_id": distinct_all_rs})
+df.to_csv("rs_ids.csv", index=False)
+print(f"\nFINAL RESULT COUNT: {len(distinct_all_rs)}")
+

@@ -1,0 +1,136 @@
+import pandas as pd
+import requests
+import time
+import xml.etree.ElementTree as ET
+
+INPUT_CSV = r"variant_clinical_input_filtered.csv"
+OUTPUT_CSV = "clinvar_required_fields.csv"
+
+BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+df = pd.read_csv(INPUT_CSV)
+df = df.drop_duplicates(subset=["rs_id"])
+
+def clean_rsid(x):
+    x = str(x).strip()
+    if x == "" or x.lower() == "nan":
+        return None
+    return x if x.startswith("rs") else "rs" + x
+
+def tag_ends(elem, name):
+    return elem.tag.lower().endswith(name.lower())
+
+def get_text_by_tag(root, tag_name):
+    for elem in root.iter():
+        if tag_ends(elem, tag_name) and elem.text:
+            return elem.text.strip()
+    return None
+
+def get_attr_by_tag(root, tag_name, attr_name):
+    for elem in root.iter():
+        if tag_ends(elem, tag_name):
+            val = elem.attrib.get(attr_name)
+            if val:
+                return val
+    return None
+
+def fetch_clinvar_ids(rsid):
+    params = {
+        "db": "clinvar",
+        "term": rsid,
+        "retmode": "json"
+    }
+    r = requests.get(f"{BASE}/esearch.fcgi", params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()["esearchresult"].get("idlist", [])
+
+def fetch_vcv_xml(clinvar_id):
+    params = {
+        "db": "clinvar",
+        "id": clinvar_id,
+        "rettype": "vcv",
+        "is_variationid": "true"
+    }
+    r = requests.get(f"{BASE}/efetch.fcgi", params=params, timeout=30)
+    r.raise_for_status()
+    return r.text
+
+rows = []
+
+for _, row in df.iterrows():
+    rsid = clean_rsid(row["rs_id"])
+    input_protein = row.get("amino_acid_substitution", "")
+
+    if not rsid:
+        continue
+
+    print("Processing:", rsid)
+
+    try:
+        ids = fetch_clinvar_ids(rsid)
+
+        if not ids:
+            rows.append({
+                "rs_id": rsid,
+                "gene": "PINK1",
+                "protein_change": input_protein,
+                "clinvar_found": "No",
+                "clinvar_id": "",
+                "clinical_significance": "Not found in ClinVar",
+                "review_status": "Not found in ClinVar"
+            })
+            continue
+
+        for clinvar_id in ids:
+            xml_text = fetch_vcv_xml(clinvar_id)
+            root = ET.fromstring(xml_text)
+
+            gene = (
+                get_attr_by_tag(root, "Gene", "Symbol")
+                or get_attr_by_tag(root, "Gene", "symbol")
+                or "PINK1"
+            )
+
+            protein_change = (
+                get_attr_by_tag(root, "VariationArchive", "VariationName")
+                or get_attr_by_tag(root, "Name", "ElementValue")
+                or input_protein
+            )
+
+            clinical_significance = (
+                get_text_by_tag(root, "Description")
+                or "Not provided"
+            )
+
+            review_status = (
+                get_text_by_tag(root, "ReviewStatus")
+                or "Not provided"
+            )
+
+            rows.append({
+                "rs_id": rsid,
+                "gene": gene,
+                "protein_change": protein_change,
+                "clinvar_found": "Yes",
+                "clinvar_id": clinvar_id,
+                "clinical_significance": clinical_significance,
+                "review_status": review_status
+            })
+
+            time.sleep(0.35)
+
+    except Exception as e:
+        rows.append({
+            "rs_id": rsid,
+            "gene": "PINK1",
+            "protein_change": input_protein,
+            "clinvar_found": "Error",
+            "clinvar_id": "",
+            "clinical_significance": str(e),
+            "review_status": "Error"
+        })
+
+out = pd.DataFrame(rows)
+out.to_csv(OUTPUT_CSV, index=False)
+
+print("Saved:", OUTPUT_CSV)

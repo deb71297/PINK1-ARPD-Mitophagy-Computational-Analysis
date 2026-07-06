@@ -1,0 +1,215 @@
+import requests
+import pandas as pd
+import time
+import re
+
+# Read rsIDs
+df = pd.read_csv("rs_ids.csv")  # change filename if needed
+rs_ids = df["rs_id"].dropna().astype(str).tolist()
+
+# Ensembl VEP endpoint
+URL = "https://rest.ensembl.org/vep/human/id"
+
+HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+}
+
+
+def chunk_list(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+
+results_list = []
+failed_batches = []
+
+BATCH_SIZE = 50
+session = requests.Session()
+
+for batch_num, batch in enumerate(chunk_list(rs_ids, BATCH_SIZE), start=1):
+
+    print(f"\nProcessing batch {batch_num} ({len(batch)} rsIDs)")
+
+    success = False
+
+    for attempt in range(10):
+
+        try:
+            response = session.post(
+                URL,
+                headers=HEADERS,
+                json={"ids": batch},
+                timeout=180
+            )
+
+            if response.status_code == 200:
+                success = True
+                break
+
+            elif response.status_code in (500, 503):
+                wait_time = min(2 ** attempt, 60)
+                print(f"HTTP {response.status_code}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+
+            elif response.status_code == 400:
+                try:
+                    error_msg = response.json().get("error", "")
+                except Exception:
+                    error_msg = response.text
+
+                match = re.search(r"No variant found with ID '([^']+)'", error_msg)
+
+                if match:
+                    bad_rsid = match.group(1)
+                    print(f"Skipping invalid rsID: {bad_rsid}")
+
+                    batch = [rs for rs in batch if rs != bad_rsid]
+
+                    if not batch:
+                        print("Batch became empty after removing invalid rsIDs.")
+                        break
+
+                    continue
+
+                print(f"HTTP 400 error: {error_msg}")
+                break
+
+            else:
+                print(f"HTTP {response.status_code}")
+                print(response.text[:500])
+                break
+
+        except requests.exceptions.RequestException as e:
+            wait_time = min(2 ** attempt, 60)
+            print(f"Request failed: {e}")
+            print(f"Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+
+    if not success:
+        failed_batches.append(batch_num)
+        print(f"Skipping batch {batch_num}")
+        continue
+
+    try:
+        batch_results = response.json()
+    except Exception as e:
+        print(f"JSON parse error: {e}")
+        failed_batches.append(batch_num)
+        continue
+
+    for data in batch_results:
+
+        rs_id = data.get("id")
+
+        amino_acid_substitution = None
+
+        polyphen_score = None
+        polyphen_prediction = None
+
+        sift_score = None
+        sift_prediction = None
+
+        transcript_consequences = data.get(
+            "transcript_consequences",
+            []
+        )
+
+        # Prefer missense variant transcript consequences
+        missense_entries = [
+            tc for tc in transcript_consequences
+            if "missense_variant" in tc.get("consequence_terms", [])
+        ]
+
+        selected_transcripts = (
+            missense_entries
+            if missense_entries
+            else transcript_consequences
+        )
+
+        # Amino acid substitution
+        aa_entries = [
+            tc for tc in selected_transcripts
+            if tc.get("amino_acids") and tc.get("protein_start")
+        ]
+
+        if aa_entries:
+            best_aa = aa_entries[0]
+
+            amino_acids = best_aa.get("amino_acids")
+            protein_pos = best_aa.get("protein_start")
+
+            if "/" in amino_acids:
+                ref_aa, alt_aa = amino_acids.split("/")
+                amino_acid_substitution = f"{ref_aa}{protein_pos}{alt_aa}"
+            else:
+                amino_acid_substitution = f"{amino_acids}{protein_pos}"
+
+        # PolyPhen-2: choose highest score
+        polyphen_entries = [
+            tc for tc in selected_transcripts
+            if tc.get("polyphen_score") is not None
+        ]
+
+        if polyphen_entries:
+            best_polyphen = max(
+                polyphen_entries,
+                key=lambda x: x["polyphen_score"]
+            )
+
+            polyphen_score = best_polyphen.get("polyphen_score")
+            polyphen_prediction = best_polyphen.get("polyphen_prediction")
+
+        # SIFT: choose lowest score
+        sift_entries = [
+            tc for tc in selected_transcripts
+            if tc.get("sift_score") is not None
+        ]
+
+        if sift_entries:
+            best_sift = min(
+                sift_entries,
+                key=lambda x: x["sift_score"]
+            )
+
+            sift_score = best_sift.get("sift_score")
+            sift_prediction = best_sift.get("sift_prediction")
+
+        results_list.append({
+            "rs_id": rs_id,
+            "amino_acid_substitution": amino_acid_substitution,
+            "polyphen_score": polyphen_score,
+            "polyphen_prediction": polyphen_prediction,
+            "sift_score": sift_score,
+            "sift_prediction": sift_prediction
+        })
+
+    pd.DataFrame(results_list).to_csv(
+        "variant_clinical_input.csv",
+        index=False
+    )
+
+    print(f"Saved {len(results_list)} variants so far")
+
+    time.sleep(1)
+
+# Final save
+results_df = pd.DataFrame(results_list)
+
+results_df.to_csv(
+    "variant_clinical_input.csv",
+    index=False
+)
+
+print(
+    f"\nDone! Saved {len(results_df)} variants "
+    f"to variant_clinical_input.csv"
+)
+
+if failed_batches:
+    print(f"Failed batches: {failed_batches}")
+else:
+    print("All batches completed successfully.")
+
+

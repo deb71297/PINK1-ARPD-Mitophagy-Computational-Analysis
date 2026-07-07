@@ -198,7 +198,7 @@ python data_visualizer.py --folders WT T313M L347P --mode rmsd
 | `WT_PINK1.pdb`                        | Wild-type PINK1 structure                         |
 | `T313M.pdb`                           | T313M mutant PINK1 structure                      |
 | `L347P.pdb`                           | L347P mutant PINK1 structure                      |
-| `Ubiquitin.pdb`                       | Ser65-phosphorylated ubiquitin structure          |
+| `1UbQ(1).pdb`                         | Ser65-phosphorylated ubiquitin structure          |
 
 ---
 
